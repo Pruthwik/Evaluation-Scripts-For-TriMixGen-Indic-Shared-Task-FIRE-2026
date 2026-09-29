@@ -8,6 +8,7 @@ import re
 import sys
 import subprocess
 from collections import Counter
+import gc
 
 required_packages = ["transformers", "torch", "numpy"]
 
@@ -49,7 +50,7 @@ def compute_m_index(tags):
     k = len(freq)
     if k == 1:
         return 0.0
-    
+    k = 3
     n = len(non_uni)
     probs = [count / n for count in freq.values()]
     numerator = 1 - sum(p ** 2 for p in probs)
@@ -83,39 +84,49 @@ def compute_fluency(sentence, model, tokenizer, device):
         if not eval_token_indices:
             return 0.0
             
-        batch_inputs = []
-        for idx in eval_token_indices:
-            w_idx = word_ids[idx]
-            # Find all tokens belonging to the same word
-            t_indices = [k for k, w in enumerate(word_ids) if w == w_idx]
-            
-            # Position of current token within the word's sub-tokens
-            j = t_indices.index(idx)
-            
-            # Mask current and all subsequent tokens of this word (PLL-word-l2r)
-            masked_ids = input_ids.clone()
-            for mask_idx in t_indices[j:]:
-                masked_ids[mask_idx] = tokenizer.mask_token_id
-            batch_inputs.append(masked_ids)
-            
-        batch_inputs = torch.stack(batch_inputs).to(device)
-        
-        with torch.no_grad():
-            logits = model(batch_inputs).logits
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            
+        # Process in batches to avoid OOM
+        fluency_batch_size = 2
         log_sum = 0.0
-        for i, idx in enumerate(eval_token_indices):
-            correct_token = input_ids[idx].item()
-            prob = probs[i, idx, correct_token].item()
-            log_sum += math.log(max(prob, 1e-9))
+        
+        for start_idx in range(0, len(eval_token_indices), fluency_batch_size):
+            end_idx = min(start_idx + fluency_batch_size, len(eval_token_indices))
+            batch_indices = eval_token_indices[start_idx:end_idx]
+            
+            batch_inputs = []
+            for idx in batch_indices:
+                w_idx = word_ids[idx]
+                # Find all tokens belonging to the same word
+                t_indices = [k for k, w in enumerate(word_ids) if w == w_idx]
+                
+                # Position of current token within the word's sub-tokens
+                j = t_indices.index(idx)
+                
+                # Mask current and all subsequent tokens of this word (PLL-word-l2r)
+                masked_ids = input_ids.clone()
+                for mask_idx in t_indices[j:]:
+                    masked_ids[mask_idx] = tokenizer.mask_token_id
+                batch_inputs.append(masked_ids)
+                
+            batch_inputs = torch.stack(batch_inputs).to(device)
+            
+            with torch.no_grad():
+                logits = model(batch_inputs).logits
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                
+            for i, idx in enumerate(batch_indices):
+                correct_token = input_ids[idx].item()
+                prob = probs[i, idx, correct_token].item()
+                log_sum += math.log(max(prob, 1e-9))
+            
+            # Clear memory after each batch
+            del batch_inputs, logits, probs
+            torch.cuda.empty_cache()
             
         val = math.exp(log_sum / len(eval_token_indices))
         return math.pow(val, 0.25)
         
     except Exception as e:
-        print(f"Error computing fluency: {e}")
-        return 0.0
+        raise RuntimeError(f"Fluency model prediction failed: {e}") from e
 
 
 def evaluate_sentence(index, tags, text, model, tokenizer, device, similarity_score):
@@ -183,7 +194,7 @@ class Scoring:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
         # Load LID model
-        model_dir = "Your Language Identification Model Path/HuggingFace Model ID"
+        model_dir = "/app/data/LID-model"
         if not os.path.exists(model_dir):
             model_dir = os.path.join(self.answer_dir, "LID-model")
 
@@ -202,7 +213,7 @@ class Scoring:
         print("LID model loaded successfully\n")
         
         # Load fluency model
-        fluency_model_dir = "Your Fluency Model Path/HuggingFace Model ID"
+        fluency_model_dir = "/app/data/Fluency-model"
         if not os.path.exists(fluency_model_dir):
             fluency_model_dir = os.path.join(self.answer_dir, "Fluency-model")
 
@@ -213,7 +224,7 @@ class Scoring:
         print("Fluency model loaded\n")
 
         # Load sentence similarity model
-        sim_model_dir = "Your Sentence Similarity Model Path/HuggingFace Model ID"
+        sim_model_dir = "/app/data/sentence-similarity-model"
         if not os.path.exists(sim_model_dir):
             sim_model_dir = os.path.join(self.answer_dir, "sentence-similarity-model")
 
@@ -237,6 +248,7 @@ class Scoring:
         }
 
         # Check sentence count for each task file before evaluation
+        found_any = False
         for score_key, filename in TASKS.items():
             filepath = os.path.join(self.prediction_dir, filename)
             
@@ -253,6 +265,9 @@ class Scoring:
                 else:
                     continue
 
+            # At this point we have a filepath that exists
+            found_any = True
+
             line_count = 0
             with open(filepath, "r", encoding="utf-8") as f:
                 for line in f:
@@ -263,6 +278,12 @@ class Scoring:
                 raise ValueError(
                     f"File {filename} has {line_count} sentences, which is not the required number of 500 sentences."
                 )
+
+        # If none of the required prediction files are present, raise an error
+        if not found_any:
+            raise FileNotFoundError(
+                "Neither eng-hin-ben nor eng-hin-guj prediction files were found in the prediction directory."
+            )
 
         scores = {}
 
@@ -292,7 +313,7 @@ class Scoring:
                 continue
 
             dataset_score = calculate_average(results, score_key)
-            scores[score_key] = math.floor(dataset_score * 10000) / 10000
+            scores[score_key] = round(dataset_score, 4)
 
         print("\nFinal Scores")
         print(scores)
@@ -331,7 +352,7 @@ class Scoring:
                         except json.JSONDecodeError as e:
                             print(f"Warning: JSON decode error in dev-data at line {line_num}: {e}")
         else:
-            print(f"Warning: Dev-data file not found at {dev_filepath}")
+            raise FileNotFoundError(f"dev-data file not found at {dev_filepath}")
 
         pred_records = []
         with open(filepath, "r", encoding="utf-8") as f:
@@ -339,11 +360,19 @@ class Scoring:
                 line = line.strip()
                 if line:
                     try:
-                        pred_records.append(json.loads(line))
+                        record = json.loads(line)
+                        if "output" not in record and "generated" not in record:
+                            raise ValueError(
+                                f"Missing 'output' or 'generated' field in prediction file {file_name} at line {line_num}"
+                            )
+                        pred_records.append(record)
                     except json.JSONDecodeError as e:
                         raise ValueError(f"Invalid JSON format in prediction file {file_name} at line {line_num}: {e}")
 
-        pred_sentences = [rec.get("output", "") if rec.get("output") is not None else "" for rec in pred_records]
+        pred_sentences = []
+        for rec in pred_records:
+            sentence = rec.get("output", rec.get("generated", ""))
+            pred_sentences.append(sentence if sentence is not None else "")
 
         if dev_records:
             similarity_scores = self.compute_similarity_scores(pred_sentences, dev_records, third_lang_key)
@@ -353,11 +382,10 @@ class Scoring:
         for line_num, record in enumerate(pred_records, 1):
             try:
                 index = record.get("index", line_num - 1)
-                text = record.get("output", "")
+                text = record.get("output", record.get("generated"))
                 if text is None:
-                    text = ""
-                else:
-                    text = str(text)
+                    raise ValueError(f"'output' or 'generated' field is None at line {line_num}")
+                text = str(text)
 
                 tags = self.predict_tags(text) if text.strip() else []
                 sim_score = similarity_scores[line_num - 1] if (line_num - 1) < len(similarity_scores) else 0.0
@@ -372,9 +400,14 @@ class Scoring:
                     sim_score,
                 )
                 results.append(result)
+                
+                # Clear memory periodically
+                if line_num % 5 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
 
             except Exception as e:
-                print(f"Error line {line_num}: {e}")
+                raise RuntimeError(f"Failed to process line {line_num} in {file_name}: {e}") from e
 
         print(f"Processed {len(results)} sentences")
         return results
@@ -383,7 +416,7 @@ class Scoring:
         """Compute sentence similarity scores for a batch of predictions."""
         self.similarity_model.eval()
 
-        def encode_batch(sentences, batch_size=32):
+        def encode_batch(sentences, batch_size=16):
             all_embeddings = []
             for i in range(0, len(sentences), batch_size):
                 batch = sentences[i:i+batch_size]
@@ -401,28 +434,47 @@ class Scoring:
                 embeddings = outputs.last_hidden_state[:, 0, :]
                 embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
                 all_embeddings.append(embeddings.cpu())
+                
+                # Clear memory after each batch
+                del inputs, outputs, embeddings
+                torch.cuda.empty_cache()
+                
             return torch.cat(all_embeddings, dim=0)
 
         n = min(len(pred_sentences), len(dev_records))
         if n == 0:
             return [0.0] * len(pred_sentences)
 
-        ref_en = [dev_records[i]["en"] for i in range(n)]
-        ref_hi = [dev_records[i]["hi"] for i in range(n)]
-        ref_lang3 = [dev_records[i][third_lang_key] for i in range(n)]
-
-        pred_embs = encode_batch(pred_sentences[:n])
-        en_embs = encode_batch(ref_en)
-        hi_embs = encode_batch(ref_hi)
-        lang3_embs = encode_batch(ref_lang3)
-
-        sim_en = torch.sum(pred_embs * en_embs, dim=1).numpy()
-        sim_hi = torch.sum(pred_embs * hi_embs, dim=1).numpy()
-        sim_lang3 = torch.sum(pred_embs * lang3_embs, dim=1).numpy()
-
-        avg_similarities = (sim_en + sim_hi + sim_lang3) / 3.0
-        scores = avg_similarities.tolist()
+        # Process in chunks to avoid OOM
+        chunk_size = 50
+        all_scores = []
         
+        for start_idx in range(0, n, chunk_size):
+            end_idx = min(start_idx + chunk_size, n)
+            
+            ref_en = [dev_records[i]["en"] for i in range(start_idx, end_idx)]
+            ref_hi = [dev_records[i]["hi"] for i in range(start_idx, end_idx)]
+            ref_lang3 = [dev_records[i][third_lang_key] for i in range(start_idx, end_idx)]
+            pred_chunk = pred_sentences[start_idx:end_idx]
+
+            pred_embs = encode_batch(pred_chunk)
+            en_embs = encode_batch(ref_en)
+            hi_embs = encode_batch(ref_hi)
+            lang3_embs = encode_batch(ref_lang3)
+
+            sim_en = torch.sum(pred_embs * en_embs, dim=1).numpy()
+            sim_hi = torch.sum(pred_embs * hi_embs, dim=1).numpy()
+            sim_lang3 = torch.sum(pred_embs * lang3_embs, dim=1).numpy()
+
+            avg_similarities = (sim_en + sim_hi + sim_lang3) / 3.0
+            all_scores.extend(avg_similarities.tolist())
+            
+            # Clear memory after each chunk
+            del pred_embs, en_embs, hi_embs, lang3_embs, sim_en, sim_hi, sim_lang3
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        scores = all_scores
         if len(pred_sentences) > n:
             scores.extend([0.0] * (len(pred_sentences) - n))
 
@@ -439,7 +491,7 @@ class Scoring:
                 tokens,
                 truncation=True,
                 is_split_into_words=True,
-                max_length=128,
+                max_length=256,
                 return_tensors="pt",
                 padding=False
             )
@@ -477,8 +529,7 @@ class Scoring:
             return predicted_tags
 
         except Exception as e:
-            print(f"LID prediction error: {e}")
-            return ["UNI"] * len(tokens)
+            raise RuntimeError(f"LID model prediction failed: {e}") from e
 
     def write_results(self, scores):
         """Write final scores to JSON file."""
